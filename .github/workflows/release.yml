@@ -11,6 +11,8 @@ permissions:
 
 jobs:
   release:
+    # Only upstream publishes to npm; a fork has no trusted publisher.
+    if: github.repository == 'baruchiro/paperless-mcp'
     runs-on: ubuntu-latest
     permissions:
       contents: write

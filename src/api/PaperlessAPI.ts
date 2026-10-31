@@ -1,5 +1,6 @@
 import axios, { AxiosResponse } from "axios";
 import FormData from "form-data";
+import type { Readable } from "node:stream";
 import {
   BulkEditDocumentsResult,
   BulkEditParameters,
@@ -107,7 +108,8 @@ export class PaperlessAPI {
   }
 
   async postDocument(
-    document: Buffer,
+    // A file stream keeps a large upload out of memory; form-data reads its length from the file.
+    document: Buffer | Readable,
     filename: string,
     metadata: Record<string, string | string[] | number | number[] | undefined> = {}
   ): Promise<string> {
@@ -150,6 +152,9 @@ export class PaperlessAPI {
             Accept: `application/json; version=${this.apiVersion}`,
             ...formData.getHeaders(),
           },
+          // follow-redirects keeps a copy of the whole body to send it again
+          // after a redirect; without redirects, a file stream stays a stream.
+          maxRedirects: 0,
         }
       );
 

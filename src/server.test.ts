@@ -1,7 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type express from "express";
-import { getBearerToken } from "./server";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { PaperlessAPI } from "./api/PaperlessAPI";
+import { createMcpServer, getBearerToken } from "./server";
+import { Uploads } from "./uploads";
 
 function reqWith(authorization?: string): express.Request {
   return {
@@ -54,4 +59,31 @@ test("anonymous access with no configured server token yields no token", () => {
     allowAnonymous: true,
   });
   assert.equal(token, undefined);
+});
+
+async function toolNames(server: McpServer) {
+  const client = new Client({ name: "server-test-client", version: "1.0.0" });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  try {
+    return (await client.listTools()).tools.map((tool) => tool.name);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+}
+
+test("the upload tools are registered only when uploads are configured", async () => {
+  const options = { baseUrl: "http://p", token: "t", version: "1", publicUrl: "http://p" };
+
+  const plain = await toolNames(createMcpServer(options));
+  assert.ok(plain.includes("list_documents"));
+  assert.ok(!plain.includes("request_upload"));
+  assert.ok(!plain.includes("check_upload"));
+
+  const uploads = new Uploads({ api: {} as PaperlessAPI, publicUrl: "https://u" });
+  const withUploads = await toolNames(createMcpServer({ ...options, uploads }));
+  assert.ok(withUploads.includes("request_upload"));
+  assert.ok(withUploads.includes("check_upload"));
 });

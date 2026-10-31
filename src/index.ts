@@ -4,11 +4,13 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import express from "express";
 import { parseArgs } from "node:util";
+import { PaperlessAPI } from "./api/PaperlessAPI";
 import {
   createMcpServer,
   getBearerToken,
   sendUnauthorized,
 } from "./server";
+import { Uploads, uploadConfig } from "./uploads";
 const { version } = require("../package.json") as { version: string };
 
 const {
@@ -60,12 +62,27 @@ if (noAuth && !resolvedToken) {
   process.exit(1);
 }
 
+let uploads: Uploads | undefined;
+try {
+  const upload = uploadConfig(process.env, useHttp!);
+  if (upload) {
+    uploads = new Uploads({
+      api: new PaperlessAPI(resolvedBaseUrl, upload.token),
+      publicUrl: upload.publicUrl,
+    });
+  }
+} catch (error) {
+  console.error((error as Error).message);
+  process.exit(1);
+}
+
 function buildServer(requestToken: string) {
   return createMcpServer({
     baseUrl: resolvedBaseUrl!,
     token: requestToken,
     version,
     publicUrl: resolvedPublicUrl!,
+    uploads,
   });
 }
 
@@ -86,6 +103,11 @@ async function main() {
     }
 
     const app = express();
+    // The upload route reads its body as a stream, so it comes before the JSON parser.
+    if (uploads) {
+      app.use(uploads.router());
+      console.log("[paperless-mcp] Upload links are enabled at /upload/.");
+    }
     app.use(express.json());
 
     // Store transports for each session

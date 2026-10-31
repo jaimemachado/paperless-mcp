@@ -68,6 +68,8 @@ Add these to your MCP config file:
 | `PAPERLESS_PUBLIC_URL` | No | `PAPERLESS_URL` | Public-facing URL for document links |
 | `PAPERLESS_API_VERSION` | No | `9` | Paperless-ngx REST API version. `9` works on Paperless-ngx v2.x (recent) and v3.x. Paperless-ngx v3.0.0 dropped support for versions below `9`, so older defaults now return HTTP 406. If you see HTTP 406 errors, set this to a version your server supports. |
 | `PAPERLESS_MCP_UPLOAD_PATHS` | No | — | Colon-separated list of allowed directories for `file_path` uploads. **Recommended for security.** Example: `/var/uploads:/tmp/scans` |
+| `PAPERLESS_UPLOAD_API_KEY` | No | — | HTTP mode only. The token of a Paperless user for upload links (see `request_upload`). Give this user only these permissions: add documents, and view tags, correspondents, document types and tasks. Set it with `PAPERLESS_UPLOAD_PUBLIC_URL`. |
+| `PAPERLESS_UPLOAD_PUBLIC_URL` | No | — | HTTP mode only. The public base URL of the route `/upload/<token>`, for example `https://paperless-upload.example.com`. Set it with `PAPERLESS_UPLOAD_API_KEY`. |
 
 That's it! Now you can ask Claude to help you manage your Paperless-NGX documents.
 
@@ -368,6 +370,20 @@ post_document({
   tags: [1, 3]
 })
 ```
+
+#### request_upload / check_upload
+Upload a file without base64 in the conversation. These tools exist only in HTTP mode, when you set `PAPERLESS_UPLOAD_API_KEY` and `PAPERLESS_UPLOAD_PUBLIC_URL`.
+
+`request_upload` makes a single-use link `<PAPERLESS_UPLOAD_PUBLIC_URL>/upload/<token>` and keeps the given title, tags, correspondent and document type. The link expires after 15 minutes. The first try uses the link, also when the try fails.
+
+- A person opens the link (`GET` gives a form) and selects the file.
+- An agent with a shell runs `curl -F file=@<path> <link>`.
+
+The server accepts one PDF, PNG, JPEG, TIFF, GIF, WebP or HEIF file of at most 50 MB. It streams the file to a temporary file, and then sends it to Paperless as the upload user, with the tag `via-mcp`. That tag must exist.
+
+`check_upload(upload_id)` gives `pending`, `receiving`, `expired`, `failed`, `submitted`, `unknown` or the status of the Paperless task. After `SUCCESS`, it also gives `document_id`.
+
+Both tools first examine the token of the caller: it must be able to view tags. The link is the only check on the upload route, so make only the path `/upload/` public. The links are in memory: run one replica.
 
 ### Document Notes
 
