@@ -9,12 +9,16 @@ import { registerDocumentTypeTools } from "./tools/documentTypes";
 import { registerMailTools } from "./tools/mail";
 import { registerNoteTools } from "./tools/notes";
 import { registerTagTools } from "./tools/tags";
+import { registerUploadTools } from "./tools/uploads";
+import { Uploads } from "./uploads";
 
 export interface CreateMcpServerOptions {
   baseUrl: string;
   token: string;
   version: string;
   publicUrl: string;
+  /** Upload links; the upload tools exist only when this is set. */
+  uploads?: Uploads;
 }
 
 export function createMcpServer({
@@ -22,6 +26,7 @@ export function createMcpServer({
   token,
   version,
   publicUrl,
+  uploads,
 }: CreateMcpServerOptions): McpServer {
   const api = new PaperlessAPI(baseUrl, token);
   const server = new McpServer(
@@ -36,6 +41,7 @@ export function createMcpServer({
   registerDocumentTypeTools(server, api);
   registerCustomFieldTools(server, api);
   registerMailTools(server, api);
+  if (uploads) registerUploadTools(server, api, uploads);
   return server;
 }
 

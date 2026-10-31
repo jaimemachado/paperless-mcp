@@ -9,6 +9,10 @@ on:
     branches:
       - master
       - main
+  # The fork publishes an image for each push to main: it has no npm release.
+  push:
+    branches:
+      - main
 
 jobs:
   build-and-push:
@@ -17,13 +21,13 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
       - name: Check if PR is from fork
         id: check-fork
         run: |
@@ -38,7 +42,7 @@ jobs:
           fi
       - name: Log in to GitHub Container Registry
         if: steps.check-fork.outputs.is_fork == 'false'
-        uses: docker/login-action@v4
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -53,7 +57,7 @@ jobs:
           fi
       - name: Extract Docker metadata
         id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: ghcr.io/${{ github.repository }}
           # value= is required: this job runs via workflow_call, so github.ref is
@@ -66,7 +70,7 @@ jobs:
             type=semver,pattern={{major}},value=${{ inputs.versionTag }},enable=${{ inputs.versionTag != '' }}
             ${{ steps.tagmeta.outputs.LATEST }}
       - name: Build (linux/amd64) for smoke test
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           file: ./Dockerfile
@@ -98,7 +102,7 @@ jobs:
           docker rm -f paperless-mcp-smoke
           exit 1
       - name: Build and push Docker image
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           file: ./Dockerfile
