@@ -3,7 +3,11 @@ import { test } from "node:test";
 import { Pool } from "pg";
 import { testPool } from "./testDb";
 import { SearchStore } from "./store";
-import { EmbeddingUnavailable, OllamaEmbedder } from "./embedder";
+import {
+  EmbeddingRejected,
+  EmbeddingUnavailable,
+  OllamaEmbedder,
+} from "./embedder";
 import { PaperlessAPI } from "../api/PaperlessAPI";
 import { IndexSync } from "./sync";
 
@@ -787,6 +791,135 @@ test("the host of the next URL does not matter, also when it starts with api", a
       ),
       paths.join("\n")
     );
+  } finally {
+    await pool.end();
+  }
+});
+
+// A document that the embedder rejects (400, 413, 422) is bad in itself: the
+// sync counts it as failed and goes on. The opposite case, a server that is
+// down or that rejects every request, must still stop the run.
+test("a document that the embedder rejects counts as failed, and the run goes on", async () => {
+  const { pool, store } = await newStore();
+  try {
+    const { api } = fakePaperless({
+      documents: [doc({ id: 1 }), doc({ id: 2 }), doc({ id: 3 })],
+    });
+    const { embedder } = fakeEmbedder({
+      failFor: (texts) => texts.some((t) => t.includes("Documento 2")),
+      failWith: () => new EmbeddingRejected("status 413"),
+    });
+
+    const { value: report, logged } = await captureErrors(() =>
+      new IndexSync({ api, store, embedder }).run()
+    );
+
+    assert.deepEqual(report, {
+      added: 2,
+      updated: 0,
+      deleted: 0,
+      metadataRefreshed: 0,
+      failed: 1,
+    });
+    const indexed = await store.indexed();
+    assert.deepEqual([...indexed.keys()].sort(), [1, 3]);
+    assert.equal(logged.length, 1);
+    assert.match(logged[0], /document 2 failed/);
+  } finally {
+    await pool.end();
+  }
+});
+
+test("a rejected document is tried again at the next run, and a later run indexes it when it is fixed", async () => {
+  const { pool, store } = await newStore();
+  try {
+    const { api } = fakePaperless({
+      documents: [doc({ id: 1 }), doc({ id: 2 })],
+    });
+    let rejecting = true;
+    const { embedder } = fakeEmbedder({
+      failFor: (texts) =>
+        rejecting && texts.some((t) => t.includes("Documento 2")),
+      failWith: () => new EmbeddingRejected("status 422"),
+    });
+    const sync = new IndexSync({ api, store, embedder });
+
+    const first = await captureErrors(() => sync.run());
+    const second = await captureErrors(() => sync.run());
+    assert.equal(first.value.failed, 1);
+    assert.equal(second.value.failed, 1);
+    assert.match(second.logged[0], /document 2 failed/);
+
+    rejecting = false;
+    const third = await sync.run();
+    assert.deepEqual(third, {
+      added: 1,
+      updated: 0,
+      deleted: 0,
+      metadataRefreshed: 0,
+      failed: 0,
+    });
+  } finally {
+    await pool.end();
+  }
+});
+
+test("a plain EmbeddingUnavailable on document 2 stops the run and leaves document 3 unindexed", async () => {
+  const { pool, store } = await newStore();
+  try {
+    const { api } = fakePaperless({
+      documents: [doc({ id: 1 }), doc({ id: 2 }), doc({ id: 3 })],
+    });
+    const { embedder } = fakeEmbedder({
+      failFor: (texts) => texts.some((t) => t.includes("Documento 2")),
+      failWith: () => new EmbeddingUnavailable("status 404"),
+    });
+
+    const { value } = await captureErrors(() =>
+      new IndexSync({ api, store, embedder }).run().then(
+        () => undefined,
+        (err) => err
+      )
+    );
+
+    assert.ok(value instanceof EmbeddingUnavailable);
+    assert.ok(!(value instanceof EmbeddingRejected));
+    const indexed = await store.indexed();
+    assert.deepEqual([...indexed.keys()], [1]);
+  } finally {
+    await pool.end();
+  }
+});
+
+test("a metadata refresh that the embedder rejects for one document counts as failed and goes on", async () => {
+  const { pool, store } = await newStore();
+  try {
+    let now = Date.parse("2024-01-01T00:00:00.000Z");
+    const documents = [doc({ id: 1 }), doc({ id: 2 }), doc({ id: 3 })];
+    const { api } = fakePaperless({ documents });
+    let rejecting = false;
+    const { embedder } = fakeEmbedder({
+      failFor: (texts) =>
+        rejecting && texts.some((t) => t.includes("Documento 2")),
+      failWith: () => new EmbeddingRejected("status 400"),
+    });
+    await new IndexSync({ api, store, embedder, now: () => now }).run();
+
+    now += 25 * 60 * 60 * 1000;
+    rejecting = true;
+    const { value: report, logged } = await captureErrors(() =>
+      new IndexSync({ api, store, embedder, now: () => now }).run()
+    );
+
+    assert.deepEqual(report, {
+      added: 0,
+      updated: 0,
+      deleted: 0,
+      metadataRefreshed: 2,
+      failed: 1,
+    });
+    assert.equal(logged.length, 1);
+    assert.match(logged[0], /document 2 failed/);
   } finally {
     await pool.end();
   }

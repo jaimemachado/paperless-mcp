@@ -8,7 +8,7 @@ import type {
   JSONRPCMessage,
 } from "@modelcontextprotocol/sdk/types";
 import { PaperlessAPI } from "../api/PaperlessAPI";
-import { EmbeddingUnavailable } from "../search/embedder";
+import { EmbeddingRejected, EmbeddingUnavailable } from "../search/embedder";
 import { Hit, SearchStore } from "../search/store";
 import { registerSearchTools } from "./search";
 
@@ -58,9 +58,14 @@ function fakeStore(opts: {
   } as unknown as SearchStore;
 }
 
-function fakeEmbedder(opts: { fail?: boolean; embedding?: number[] }) {
+function fakeEmbedder(opts: {
+  fail?: boolean;
+  reject?: boolean;
+  embedding?: number[];
+}) {
   return {
     embedQuery: async () => {
+      if (opts.reject) throw new EmbeddingRejected("status 413");
       if (opts.fail) throw new EmbeddingUnavailable("Ollama did not answer");
       return opts.embedding ?? [0.1, 0.2, 0.3];
     },
@@ -429,3 +434,37 @@ test("the results keep the rank order, not the order of the Paperless answer", a
     [1, 2]
   );
 });
+
+test(
+  "a query that the embedder rejects falls back to text hits with semantic unavailable",
+  { timeout: 5000 },
+  async () => {
+    const store = fakeStore({ text: [hit(5, 1.1, "paper trail")] });
+    const embedder = fakeEmbedder({ reject: true });
+    const { api } = fakeApi([
+      {
+        id: 5,
+        title: "Doc 5",
+        created: "2026-01-02",
+        correspondent: null,
+        document_type: null,
+        tags: [],
+      },
+    ]);
+
+    await withClient(
+      api,
+      { store, embedder, publicUrl: "https://paperless.example.test" },
+      async (client) => {
+        const result = (await client.callTool({
+          name: "semantic_search",
+          arguments: { query: "invoice" },
+        })) as CallToolResult;
+        assert.ok(!result.isError);
+        const body = parseToolText(result);
+        assert.equal(body.semantic, "unavailable");
+        assert.equal(body.results[0].matched, "words");
+      }
+    );
+  }
+);

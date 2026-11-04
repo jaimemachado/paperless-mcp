@@ -10,6 +10,25 @@ export const QUERY_PREFIX =
 
 export class EmbeddingUnavailable extends Error {}
 
+/**
+ * The server refused this input, and no other: the input is too long, or has
+ * too many parts. The sync skips the document. It extends EmbeddingUnavailable,
+ * so the search falls back to words, and the error count stays the same.
+ */
+export class EmbeddingRejected extends EmbeddingUnavailable {}
+
+// Only these statuses say that the input is bad. A 401, 403 or 404 (a wrong
+// key, model or URL) and a 408, 429 or 5xx hit every document, and to go on
+// would hide a fault behind a run that looks green.
+const REJECTED_STATUSES = new Set([400, 413, 422]);
+
+function statusError(server: string, status: number): EmbeddingUnavailable {
+  const message = `${server} answered with status ${status}`;
+  return REJECTED_STATUSES.has(status)
+    ? new EmbeddingRejected(message)
+    : new EmbeddingUnavailable(message);
+}
+
 export interface Embedder {
   embedDocuments(texts: string[]): Promise<number[][]>;
   embedQuery(query: string): Promise<number[]>;
@@ -81,9 +100,7 @@ export class OllamaEmbedder implements Embedder {
         throw new EmbeddingUnavailable(`Ollama did not answer: ${err}`);
       }
       if (!response.ok) {
-        throw new EmbeddingUnavailable(
-          `Ollama answered with status ${response.status}`
-        );
+        throw statusError("Ollama", response.status);
       }
       const body = (await response.json()) as EmbedResponse;
       if (
@@ -154,9 +171,7 @@ export class OpenAIEmbedder implements Embedder {
       );
     }
     if (!response.ok) {
-      throw new EmbeddingUnavailable(
-        `The embedding server answered with status ${response.status}`
-      );
+      throw statusError("The embedding server", response.status);
     }
     const body = (await response.json()) as OpenAIEmbedResponse;
     if (!Array.isArray(body.data) || body.data.length !== input.length) {

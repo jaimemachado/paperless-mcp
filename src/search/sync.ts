@@ -1,6 +1,10 @@
 import { PaperlessAPI } from "../api/PaperlessAPI";
 import { chunkText, metadataText } from "./chunk";
-import { EmbeddingUnavailable, type Embedder } from "./embedder";
+import {
+  EmbeddingRejected,
+  EmbeddingUnavailable,
+  type Embedder,
+} from "./embedder";
 import { SearchStore, StoredChunk } from "./store";
 import { tracer } from "../tracing";
 import {
@@ -50,6 +54,14 @@ function pathAfterApi(url: string): string {
 
 function toNameMap(rows: { id: number; name: string }[]): Map<number, string> {
   return new Map(rows.map((row) => [row.id, row.name]));
+}
+
+// A rejected input is the fault of one document: count it as failed and go
+// on. Any other embedding error can hit every document, so it stops the run.
+function stopsRun(err: unknown): boolean {
+  return (
+    err instanceof EmbeddingUnavailable && !(err instanceof EmbeddingRejected)
+  );
 }
 
 function errorMessage(err: unknown): string {
@@ -179,7 +191,7 @@ export class IndexSync {
         if (indexed.has(id)) report.updated++;
         else report.added++;
       } catch (err) {
-        if (err instanceof EmbeddingUnavailable) {
+        if (stopsRun(err)) {
           console.error(
             `[paperless-mcp] index: the embedding server is unavailable, stopping the run`
           );
@@ -201,7 +213,7 @@ export class IndexSync {
         await this.refreshMetadata(id, names);
         report.metadataRefreshed++;
       } catch (err) {
-        if (err instanceof EmbeddingUnavailable) {
+        if (stopsRun(err)) {
           console.error(
             `[paperless-mcp] index: the embedding server is unavailable, stopping the run`
           );
