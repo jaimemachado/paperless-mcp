@@ -9,6 +9,12 @@ import {
   OllamaEmbedder,
 } from "./embedder";
 import { PaperlessAPI } from "../api/PaperlessAPI";
+import {
+  register,
+  syncFailedByDocument,
+  syncFailedDocuments,
+} from "../metrics";
+import { gaugeValues } from "../testMetrics";
 import { IndexSync } from "./sync";
 
 const DIMENSIONS = 1024;
@@ -193,6 +199,7 @@ test("a new document is added", async () => {
       deleted: 0,
       metadataRefreshed: 0,
       failed: 0,
+      failures: [],
     });
     const indexed = await store.indexed();
     assert.ok(indexed.has(1));
@@ -229,6 +236,7 @@ test("a changed modified updates the document", async () => {
       deleted: 0,
       metadataRefreshed: 0,
       failed: 0,
+      failures: [],
     });
     const indexed = await store.indexed();
     assert.equal(indexed.get(1)?.modified, "2024-02-02T00:00:00.000Z");
@@ -257,6 +265,7 @@ test("a document missing from Paperless is deleted, also its chunks", async () =
       deleted: 1,
       metadataRefreshed: 0,
       failed: 0,
+      failures: [],
     });
     const indexed = await store.indexed();
     assert.equal(indexed.has(1), false);
@@ -331,6 +340,7 @@ test("an embedder that throws for document 2 only leaves document 2 with its old
       deleted: 0,
       metadataRefreshed: 0,
       failed: 1,
+      failures: [{ id: 2, reason: "error" }],
     });
     const after = await store.indexed();
     assert.deepEqual(after.get(2), before.get(2));
@@ -395,6 +405,7 @@ test("after 25 hours the metadata chunks are made again with a renamed tag", asy
       deleted: 0,
       metadataRefreshed: 1,
       failed: 0,
+      failures: [],
     });
     const chunk = await pool.query(
       "SELECT text FROM chunks WHERE document_id = $1 AND position = 0",
@@ -546,6 +557,7 @@ test(
         deleted: 0,
         metadataRefreshed: 0,
         failed: 0,
+        failures: [],
       });
     } finally {
       await pool.end();
@@ -688,8 +700,9 @@ test("a metadata refresh that fails for one document counts as failed and goes o
       deleted: 0,
       metadataRefreshed: 1,
       failed: 1,
+      failures: [{ id: 1, reason: "error" }],
     });
-    assert.equal(logged.length, 1);
+    assert.equal(logged.length, 2);
     assert.match(logged[0], /document 1 failed/);
   } finally {
     await pool.end();
@@ -820,10 +833,11 @@ test("a document that the embedder rejects counts as failed, and the run goes on
       deleted: 0,
       metadataRefreshed: 0,
       failed: 1,
+      failures: [{ id: 2, reason: "rejected" }],
     });
     const indexed = await store.indexed();
     assert.deepEqual([...indexed.keys()].sort(), [1, 3]);
-    assert.equal(logged.length, 1);
+    assert.equal(logged.length, 2);
     assert.match(logged[0], /document 2 failed/);
   } finally {
     await pool.end();
@@ -858,6 +872,7 @@ test("a rejected document is tried again at the next run, and a later run indexe
       deleted: 0,
       metadataRefreshed: 0,
       failed: 0,
+      failures: [],
     });
   } finally {
     await pool.end();
@@ -917,9 +932,272 @@ test("a metadata refresh that the embedder rejects for one document counts as fa
       deleted: 0,
       metadataRefreshed: 2,
       failed: 1,
+      failures: [{ id: 2, reason: "rejected" }],
     });
-    assert.equal(logged.length, 1);
+    assert.equal(logged.length, 2);
     assert.match(logged[0], /document 2 failed/);
+  } finally {
+    await pool.end();
+  }
+});
+
+const FAILED_DOCUMENT = "paperless_sync_failed_document";
+const FAILED_COUNT = "paperless_sync_failed_documents";
+
+// The gauges are in the registry of the process, so each test starts clean.
+function resetFailureMetrics() {
+  syncFailedByDocument.reset();
+  syncFailedDocuments.set(0);
+}
+
+const bySeries = (
+  series: { labels: Record<string, string>; value: number }[]
+) =>
+  series
+    .slice()
+    .sort((a, b) => a.labels.document_id.localeCompare(b.labels.document_id));
+
+test("a rejected document is in the gauges with the reason rejected, and the log names it", async () => {
+  resetFailureMetrics();
+  const { pool, store } = await newStore();
+  try {
+    const { api } = fakePaperless({
+      documents: [doc({ id: 1 }), doc({ id: 2 }), doc({ id: 3 })],
+    });
+    const { embedder } = fakeEmbedder({
+      failFor: (texts) => texts.some((t) => t.includes("Documento 2")),
+      failWith: () => new EmbeddingRejected("status 413"),
+    });
+
+    const { value: report, logged } = await captureErrors(() =>
+      new IndexSync({ api, store, embedder }).run()
+    );
+
+    assert.deepEqual(report.failures, [{ id: 2, reason: "rejected" }]);
+    assert.deepEqual(await gaugeValues(FAILED_DOCUMENT), [
+      { labels: { document_id: "2", reason: "rejected" }, value: 1 },
+    ]);
+    assert.deepEqual(await gaugeValues(FAILED_COUNT), [
+      { labels: {}, value: 1 },
+    ]);
+    assert.deepEqual(logged, [
+      "[paperless-mcp] index: document 2 failed (rejected): status 413",
+      "[paperless-mcp] index: 1 document(s) failed: 2 (rejected)",
+    ]);
+  } finally {
+    await pool.end();
+  }
+});
+
+test("a later run that indexes the document clears its series and sets the count to 0", async () => {
+  resetFailureMetrics();
+  const { pool, store } = await newStore();
+  try {
+    const { api } = fakePaperless({
+      documents: [doc({ id: 1 }), doc({ id: 2 })],
+    });
+    let rejecting = true;
+    const { embedder } = fakeEmbedder({
+      failFor: (texts) =>
+        rejecting && texts.some((t) => t.includes("Documento 2")),
+      failWith: () => new EmbeddingRejected("status 422"),
+    });
+    const sync = new IndexSync({ api, store, embedder });
+
+    await captureErrors(() => sync.run());
+    assert.equal((await gaugeValues(FAILED_DOCUMENT)).length, 1);
+
+    rejecting = false;
+    const second = await sync.run();
+
+    assert.deepEqual(second.failures, []);
+    assert.deepEqual(await gaugeValues(FAILED_DOCUMENT), []);
+    assert.deepEqual(await gaugeValues(FAILED_COUNT), [
+      { labels: {}, value: 0 },
+    ]);
+  } finally {
+    await pool.end();
+  }
+});
+
+test("an error that is not a rejection gives the reason error, and the summary lists both", async () => {
+  resetFailureMetrics();
+  const { pool, store } = await newStore();
+  try {
+    const { api } = fakePaperless({
+      documents: [doc({ id: 1 }), doc({ id: 2 }), doc({ id: 3 })],
+    });
+    const embedder = {
+      embedDocuments: async (texts: string[]) => {
+        if (texts.some((t) => t.includes("Documento 2"))) {
+          throw new EmbeddingRejected("status 400");
+        }
+        if (texts.some((t) => t.includes("Documento 3"))) {
+          throw new Error("something broke");
+        }
+        return texts.map(vectorFor);
+      },
+      embedQuery: async (query: string) => vectorFor(query),
+    } as unknown as OllamaEmbedder;
+
+    const { value: report, logged } = await captureErrors(() =>
+      new IndexSync({ api, store, embedder }).run()
+    );
+
+    assert.deepEqual(report.failures, [
+      { id: 2, reason: "rejected" },
+      { id: 3, reason: "error" },
+    ]);
+    assert.deepEqual(bySeries(await gaugeValues(FAILED_DOCUMENT)), [
+      { labels: { document_id: "2", reason: "rejected" }, value: 1 },
+      { labels: { document_id: "3", reason: "error" }, value: 1 },
+    ]);
+    assert.deepEqual(await gaugeValues(FAILED_COUNT), [
+      { labels: {}, value: 2 },
+    ]);
+    assert.equal(
+      logged[logged.length - 1],
+      "[paperless-mcp] index: 2 document(s) failed: 2 (rejected), 3 (error)"
+    );
+  } finally {
+    await pool.end();
+  }
+});
+
+test("a run that stops with EmbeddingUnavailable leaves the gauges of the last finished run", async () => {
+  resetFailureMetrics();
+  const { pool, store } = await newStore();
+  try {
+    let down = false;
+    const embedder = {
+      embedDocuments: async (texts: string[]) => {
+        if (down) throw new EmbeddingUnavailable("status 503");
+        if (texts.some((t) => t.includes("Documento 2"))) {
+          throw new EmbeddingRejected("status 413");
+        }
+        return texts.map(vectorFor);
+      },
+      embedQuery: async (query: string) => vectorFor(query),
+    } as unknown as OllamaEmbedder;
+
+    await captureErrors(() =>
+      new IndexSync({
+        api: fakePaperless({ documents: [doc({ id: 1 }), doc({ id: 2 })] }).api,
+        store,
+        embedder,
+      }).run()
+    );
+    const before = {
+      documents: await gaugeValues(FAILED_DOCUMENT),
+      count: await gaugeValues(FAILED_COUNT),
+    };
+    assert.equal(before.documents.length, 1);
+
+    // Document 1 changed, and the server is down: the run stops at document 1.
+    down = true;
+    const { value } = await captureErrors(() =>
+      new IndexSync({
+        api: fakePaperless({
+          documents: [
+            doc({ id: 1, modified: "2024-02-02T00:00:00.000Z" }),
+            doc({ id: 2 }),
+          ],
+        }).api,
+        store,
+        embedder,
+      })
+        .run()
+        .then(
+          () => undefined,
+          (err) => err
+        )
+    );
+
+    assert.ok(value instanceof EmbeddingUnavailable);
+    assert.deepEqual(await gaugeValues(FAILED_DOCUMENT), before.documents);
+    assert.deepEqual(await gaugeValues(FAILED_COUNT), before.count);
+  } finally {
+    await pool.end();
+  }
+});
+
+test("the metrics text has no title and no error message of a document", async () => {
+  resetFailureMetrics();
+  const { pool, store } = await newStore();
+  try {
+    const { api } = fakePaperless({
+      documents: [
+        doc({ id: 1 }),
+        doc({ id: 2, title: "Titulo privado de prueba" }),
+      ],
+    });
+    const { embedder } = fakeEmbedder({
+      failFor: (texts) =>
+        texts.some((t) => t.includes("Titulo privado de prueba")),
+      failWith: () => new EmbeddingRejected("mensaje-secreto-del-servidor"),
+    });
+
+    await captureErrors(() => new IndexSync({ api, store, embedder }).run());
+
+    const text = await register.metrics();
+    assert.match(text, /paperless_sync_failed_document\{/);
+    assert.ok(!text.includes("Titulo privado"));
+    assert.ok(!text.includes("mensaje-secreto"));
+  } finally {
+    await pool.end();
+  }
+});
+
+test("a document that fails in both loops counts once", async () => {
+  resetFailureMetrics();
+  const { pool, store } = await newStore();
+  try {
+    let now = Date.parse("2024-01-01T00:00:00.000Z");
+    const { embedder: okEmbedder } = fakeEmbedder();
+    await new IndexSync({
+      api: fakePaperless({ documents: [doc({ id: 1 }), doc({ id: 2 })] }).api,
+      store,
+      embedder: okEmbedder,
+      now: () => now,
+    }).run();
+
+    // Document 2 changed, so the first loop tries it. A day later its metadata
+    // is old, so the second loop tries it too. The embedder rejects both.
+    now += 25 * 60 * 60 * 1000;
+    const { embedder } = fakeEmbedder({
+      failFor: (texts) => texts.some((t) => t.includes("Documento 2")),
+      failWith: () => new EmbeddingRejected("status 413"),
+    });
+    const { value: report, logged } = await captureErrors(() =>
+      new IndexSync({
+        api: fakePaperless({
+          documents: [
+            doc({ id: 1 }),
+            doc({ id: 2, modified: "2024-02-02T00:00:00.000Z" }),
+          ],
+        }).api,
+        store,
+        embedder,
+        now: () => now,
+      }).run()
+    );
+
+    assert.deepEqual(report, {
+      added: 0,
+      updated: 0,
+      deleted: 0,
+      metadataRefreshed: 1,
+      failed: 1,
+      failures: [{ id: 2, reason: "rejected" }],
+    });
+    assert.equal((await gaugeValues(FAILED_DOCUMENT)).length, 1);
+    assert.deepEqual(await gaugeValues(FAILED_COUNT), [
+      { labels: {}, value: 1 },
+    ]);
+    assert.equal(
+      logged.filter((line) => line.includes("1 document(s) failed")).length,
+      1
+    );
   } finally {
     await pool.end();
   }

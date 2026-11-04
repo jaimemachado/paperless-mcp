@@ -11,6 +11,8 @@ import {
   chunksIndexed,
   documentsIndexed,
   syncDuration,
+  syncFailedByDocument,
+  syncFailedDocuments,
   syncRuns,
 } from "../metrics";
 
@@ -22,12 +24,17 @@ const MAX_LIST_PAGES = 10_000;
 // Without a limit, a Paperless that never answers would keep the run pending for ever.
 const REQUEST_TIMEOUT_MS = 60_000;
 
+// rejected: the embedder refused this input (400, 413, 422). error: any other fault.
+export type FailureReason = "rejected" | "error";
+
 export interface SyncReport {
   added: number;
   updated: number;
   deleted: number;
   metadataRefreshed: number;
   failed: number;
+  /** The documents that failed, by id. A document is in the list once. */
+  failures: { id: number; reason: FailureReason }[];
 }
 
 interface NameMaps {
@@ -62,6 +69,10 @@ function stopsRun(err: unknown): boolean {
   return (
     err instanceof EmbeddingUnavailable && !(err instanceof EmbeddingRejected)
   );
+}
+
+function reasonOf(err: unknown): FailureReason {
+  return err instanceof EmbeddingRejected ? "rejected" : "error";
 }
 
 function errorMessage(err: unknown): string {
@@ -140,6 +151,7 @@ export class IndexSync {
       deleted: 0,
       metadataRefreshed: 0,
       failed: 0,
+      failures: [],
     };
 
     const remote = new Map<number, string>();
@@ -197,10 +209,7 @@ export class IndexSync {
           );
           throw err;
         }
-        report.failed++;
-        console.error(
-          `[paperless-mcp] index: document ${id} failed: ${errorMessage(err)}`
-        );
+        this.fail(report, id, err);
       }
     }
 
@@ -219,13 +228,11 @@ export class IndexSync {
           );
           throw err;
         }
-        report.failed++;
-        console.error(
-          `[paperless-mcp] index: document ${id} failed: ${errorMessage(err)}`
-        );
+        this.fail(report, id, err);
       }
     }
 
+    this.publishFailures(report);
     syncRuns.inc({ outcome: "success" });
     try {
       documentsIndexed.set(await this.store.countDocuments());
@@ -234,6 +241,38 @@ export class IndexSync {
       // The gauges are a view of the store, not part of the sync.
     }
     return report;
+  }
+
+  // A document that fails in both loops of a run counts once.
+  private fail(report: SyncReport, id: number, err: unknown): void {
+    const reason = reasonOf(err);
+    if (!report.failures.some((failure) => failure.id === id)) {
+      report.failures.push({ id, reason });
+      report.failed++;
+    }
+    console.error(
+      `[paperless-mcp] index: document ${id} failed (${reason}): ${errorMessage(
+        err
+      )}`
+    );
+  }
+
+  // Only a run that reaches its end calls this. A run that a thrown error
+  // stops keeps the last list, because it did not look at every document.
+  private publishFailures(report: SyncReport): void {
+    syncFailedByDocument.reset();
+    for (const { id, reason } of report.failures) {
+      syncFailedByDocument.set({ document_id: String(id), reason }, 1);
+    }
+    syncFailedDocuments.set(report.failed);
+    if (report.failures.length > 0) {
+      const ids = report.failures
+        .map(({ id, reason }) => `${id} (${reason})`)
+        .join(", ");
+      console.error(
+        `[paperless-mcp] index: ${report.failed} document(s) failed: ${ids}`
+      );
+    }
   }
 
   // A Paperless list can have several pages, and `next` gives the next page.
