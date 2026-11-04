@@ -100,3 +100,18 @@ export function httpTiming(req: Request, res: Response, next: NextFunction) {
   res.on("finish", () => end({ status: String(res.statusCode) }));
   next();
 }
+
+export const syncFailedDocuments = new Gauge({
+  name: "paperless_sync_failed_documents",
+  help: "Documents that failed to sync in the last run that reached its end.",
+  registers: [register],
+});
+
+// The labels are a fixed set (reason) and ids. Never put a title or an error
+// message here: both can hold text of a document, and have no limit on values.
+export const syncFailedByDocument = new Gauge({
+  name: "paperless_sync_failed_document",
+  help: "1 for each document that failed to sync in the last run that reached its end. reason is rejected (the embedder refused the input) or error.",
+  labelNames: ["document_id", "reason"],
+  registers: [register],
+});
