@@ -4,6 +4,7 @@ import type { AddressInfo } from "node:net";
 import { describe, test } from "node:test";
 import { register } from "../metrics";
 import {
+  EmbeddingRejected,
   EmbeddingUnavailable,
   OllamaEmbedder,
   OpenAIEmbedder,
@@ -436,4 +437,88 @@ describe("OpenAIEmbedder", () => {
       EmbeddingUnavailable
     );
   });
+});
+
+// A 4xx for the input means that this input is bad: the sync skips the
+// document. Any other status can hit every document, so it stops the run.
+describe("the error for a status of the embedding server", () => {
+  const rejected = [400, 413, 422];
+  const unavailable = [401, 403, 404, 408, 429, 500, 502, 503];
+
+  function answering(status: number) {
+    const server = http.createServer((_req, res) => {
+      res.writeHead(status);
+      res.end("no");
+    });
+    return server;
+  }
+
+  const providers = [
+    {
+      name: "OllamaEmbedder",
+      make: (url: string) => new OllamaEmbedder({ url, model: "m" }),
+    },
+    {
+      name: "OpenAIEmbedder",
+      make: (url: string) => new OpenAIEmbedder({ url, model: "m" }),
+    },
+  ];
+
+  for (const { name, make } of providers) {
+    for (const status of rejected) {
+      test(`${name}: status ${status} throws EmbeddingRejected, which is an EmbeddingUnavailable`, async () => {
+        const server = answering(status);
+        const url = await listen(server);
+        try {
+          for (const call of [
+            () => make(url).embedDocuments(["a"]),
+            () => make(url).embedQuery("a"),
+          ]) {
+            await assert.rejects(call, (err) => {
+              assert.ok(err instanceof EmbeddingRejected);
+              assert.ok(err instanceof EmbeddingUnavailable);
+              return true;
+            });
+          }
+        } finally {
+          server.close();
+        }
+      });
+    }
+
+    for (const status of unavailable) {
+      test(`${name}: status ${status} throws a plain EmbeddingUnavailable`, async () => {
+        const server = answering(status);
+        const url = await listen(server);
+        try {
+          for (const call of [
+            () => make(url).embedDocuments(["a"]),
+            () => make(url).embedQuery("a"),
+          ]) {
+            await assert.rejects(call, (err) => {
+              assert.ok(err instanceof EmbeddingUnavailable);
+              assert.ok(!(err instanceof EmbeddingRejected));
+              return true;
+            });
+          }
+        } finally {
+          server.close();
+        }
+      });
+    }
+
+    test(`${name}: a refused connection throws a plain EmbeddingUnavailable`, async () => {
+      const server = answering(200);
+      const url = await listen(server);
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await assert.rejects(
+        () => make(url).embedDocuments(["a"]),
+        (err) => {
+          assert.ok(err instanceof EmbeddingUnavailable);
+          assert.ok(!(err instanceof EmbeddingRejected));
+          return true;
+        }
+      );
+    });
+  }
 });
